@@ -162,36 +162,56 @@ def merge_nearby_regions(regions, proximity_threshold_px, gray_image):
 def cleanup_debug_directory(debug_base_dir, max_dirs_to_keep=5):
     """Clean up old debug directories, keeping only the most recent ones"""
     try:
+        # Ensure the directory exists
+        if not os.path.exists(debug_base_dir):
+            return
+            
         # List all debug directories
-        debug_dirs = [d for d in os.listdir(debug_base_dir) if d.startswith('debug_')]
-        debug_dirs.sort(reverse=True)  # Sort newest to oldest
+        debug_dirs = []
+        for d in os.listdir(debug_base_dir):
+            if d.startswith('debug_'):
+                dir_path = os.path.join(debug_base_dir, d)
+                if os.path.isdir(dir_path):
+                    debug_dirs.append(d)
+        
+        # Sort by name (timestamp) newest to oldest
+        debug_dirs.sort(reverse=True)
         
         # Remove old directories beyond the limit
         for old_dir in debug_dirs[max_dirs_to_keep:]:
-            old_path = os.path.join(debug_base_dir, old_dir)
             try:
-                shutil.rmtree(old_path)
-                print(f"Cleaned up old debug directory: {old_dir}")
+                old_path = os.path.join(debug_base_dir, old_dir)
+                if os.path.exists(old_path):
+                    shutil.rmtree(old_path, ignore_errors=True)
             except Exception as e:
-                print(f"Error cleaning up {old_dir}: {str(e)}")
+                # Log error but continue
+                pass
+                
     except Exception as e:
-        print(f"Error during debug cleanup: {str(e)}")
+        # Log error but continue
+        pass
 
 def create_debug_directory(output_folder):
-    """Create a timestamped debug directory and clean up old ones"""
-    # Create base debug directory if it doesn't exist
-    debug_base = os.path.join(output_folder, "debug")
-    os.makedirs(debug_base, exist_ok=True)
-    
-    # Create timestamped subdirectory
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    debug_dir = os.path.join(debug_base, f"debug_{timestamp}")
-    os.makedirs(debug_dir, exist_ok=True)
-    
-    # Clean up old debug directories
-    cleanup_debug_directory(debug_base)
-    
-    return debug_dir
+    """Create a timestamped debug directory"""
+    try:
+        # Create base debug directory if it doesn't exist
+        debug_base = os.path.join(output_folder, "debug")
+        os.makedirs(debug_base, exist_ok=True)
+        
+        # Create timestamped subdirectory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_dir = os.path.join(debug_base, f"debug_{timestamp}")
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Clean up old directories silently
+        cleanup_debug_directory(debug_base)
+        
+        return debug_dir
+        
+    except Exception as e:
+        # If debug directory creation fails, return None
+        print(f"Warning: Could not create debug directory: {str(e)}")
+        return None
 
 def find_text_boundaries(gray_image, x, y, w, h, padding_cm=1.0):
     """
@@ -225,6 +245,76 @@ def find_text_boundaries(gray_image, x, y, w, h, padding_cm=1.0):
     new_h = min(height - new_y, (max_y - min_y + 2 * padding_px))
     
     return new_x, new_y, new_w, new_h
+
+def correct_skew(image, debug_dir=None, debug_prefix="", debug=False):
+    """Correct the skew of an image using OpenCV's minAreaRect and detect text orientation."""
+    # Convert image to grayscale if it isn't already
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image.copy()
+    
+    # Threshold the image
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Find coordinates of all pixels greater than zero
+    coords = np.column_stack(np.where(thresh > 0))
+    if len(coords) == 0:
+        return image
+    
+    # Get the minimum area rectangle
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    
+    # Modified angle adjustment logic for better vertical alignment
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+    
+    if debug:
+        print(f"Initial angle adjustment: {angle:.2f} degrees")
+    
+    # First rotation to get roughly vertical
+    (h, w) = image.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        image, M, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+    
+    # Check if text is upside down using OCR
+    text = pytesseract.image_to_string(rotated, config='--psm 6')
+    numbers_current = len(re.findall(r'\d+\.\d{2}', text))
+    
+    # Try 180-degree rotation
+    M_180 = cv2.getRotationMatrix2D(center, 180, 1.0)
+    rotated_180 = cv2.warpAffine(rotated, M_180, (w, h),
+                                flags=cv2.INTER_CUBIC,
+                                borderMode=cv2.BORDER_REPLICATE)
+    text_180 = pytesseract.image_to_string(rotated_180, config='--psm 6')
+    numbers_180 = len(re.findall(r'\d+\.\d{2}', text_180))
+    
+    # Use the orientation with more detected numbers
+    if numbers_180 > numbers_current:
+        rotated = rotated_180
+        if debug:
+            print("Receipt was upside down - corrected orientation")
+    
+    # Evaluate if rotation improved alignment
+    if evaluate_rotation_quality(image, rotated):
+        if debug:
+            print("Rotation improved text alignment")
+            if debug_dir:
+                cv2.imwrite(os.path.join(debug_dir, f"{debug_prefix}_rotated.png"),
+                           cv2.cvtColor(rotated, cv2.COLOR_RGB2BGR))
+        return rotated
+    else:
+        if debug:
+            print("Rotation did not improve alignment - keeping original")
+        return image
 
 def detect_receipts(image):
     """Detect and return coordinates of multiple receipts in an image"""
@@ -341,18 +431,7 @@ def detect_receipts(image):
     # Sort contours top-to-bottom, then left-to-right
     final_contours.sort(key=lambda x: (x[1], x[0]))
     
-    # Save debug images
-    debug_image = image_np.copy()
-    
-    # Draw original contours in blue
-    for i, (x, y, w, h) in enumerate(unique_contours):
-        cv2.rectangle(debug_image, (x, y), (x+w, y+h), (255, 0, 0), 2)
-        cv2.putText(debug_image, f"Original {i+1}", (x+10, y+30), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
-    cv2.imwrite(os.path.join(debug_dir, "5_original_contours.png"), 
-                cv2.cvtColor(debug_image, cv2.COLOR_RGB2BGR))
-    
-    # Draw final contours in green
+    # Draw debug visualizations
     debug_image = image_np.copy()
     for i, (x, y, w, h) in enumerate(final_contours):
         cv2.rectangle(debug_image, (x, y), (x+w, y+h), (0, 255, 0), 2)
@@ -520,109 +599,109 @@ def create_filename(date, vendor, amount):
     return f"{date}_{vendor}_{formatted_amount}.pdf"
 
 def split_pages(input_path, output_folder):
-    """Split PDF pages into separate files"""
     try:
-        # Create output folder if it doesn't exist
-        os.makedirs(output_folder, exist_ok=True)
-        
-        # Create debug folder
-        debug_dir = os.path.join(output_folder, "debug")
-        os.makedirs(debug_dir, exist_ok=True)
-        
-        # Open the PDF file
-        pdf = PdfReader(input_path)
-        print(f"Successfully opened PDF with {len(pdf.pages)} pages")
+        # Create debug directory
+        debug_dir = create_debug_directory(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         
         # Process each page
-        for page_num in range(len(pdf.pages)):
+        reader = PdfReader(input_path)
+        print(f"\nSuccessfully opened PDF with {len(reader.pages)} pages")
+        
+        for page_num in range(len(reader.pages)):
             print(f"\nProcessing page {page_num + 1}")
             
-            # Convert page to image
+            # Convert PDF page to images
             images = convert_from_path(
-                input_path,
+                pdf_path=input_path,
                 first_page=page_num + 1,
                 last_page=page_num + 1,
                 poppler_path=r'C:\Program Files\poppler-24.08.0\Library\bin'
             )
             
-            if not images:
-                print(f"No image found for page {page_num + 1}")
-                continue
+            if images:
+                # Remove page-level rotation correction
+                page_image = images[0]
                 
-            page_image = images[0]
-            
-            # Save original page image for reference
-            page_image.save(os.path.join(debug_dir, f"page_{page_num + 1}_original.png"))
-            
-            # Detect receipt regions
-            receipt_regions = detect_receipts(page_image)
-            print(f"Found {len(receipt_regions)} receipt regions on page {page_num + 1}")
-            
-            # Process each receipt region
-            for i, (x, y, w, h) in enumerate(receipt_regions):
-                try:
-                    # Crop the image to get just this receipt
-                    receipt_image = page_image.crop((x, y, x+w, y+h))
-                    
-                    # Save debug image of cropped receipt
-                    receipt_image.save(os.path.join(debug_dir, f"page_{page_num + 1}_receipt_{i + 1}.png"))
-                    
-                    # Extract text from this specific receipt region
-                    text = pytesseract.image_to_string(receipt_image)
-                    print(f"\nProcessing receipt {i+1}:")
-                    print(f"Extracted text length: {len(text)}")
-                    
-                    # Save extracted text for debugging
-                    with open(os.path.join(debug_dir, f"page_{page_num + 1}_receipt_{i + 1}_text.txt"), 'w') as f:
-                        f.write(text)
-                    
-                    # Extract receipt information
-                    date = extract_date(text)
-                    vendor = extract_vendor(text)
-                    amount = extract_amount(text)
-                    
-                    print(f"Extracted info - Date: {date}, Vendor: {vendor}, Amount: {amount}")
-                    
-                    # Create filename
-                    base_filename = create_filename(date, vendor, amount)
-                    # Always add receipt number if multiple receipts found
-                    if len(receipt_regions) > 1:
-                        filename = f"{base_filename[:-4]}_{i+1}.pdf"
-                    else:
-                        filename = base_filename
-                    
-                    # Save the cropped image temporarily
-                    temp_image_path = os.path.join(output_folder, f"temp_receipt_{i}.png")
-                    receipt_image.save(temp_image_path)
-                    
-                    # Create a new PDF from the cropped image
-                    pdf_writer = PdfWriter()
-                    with Image.open(temp_image_path) as img:
-                        # Convert to RGB if needed
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        # Create PDF from image
-                        img_path = os.path.join(output_folder, f"temp_receipt_{i}.pdf")
-                        img.save(img_path, 'PDF', resolution=100.0)
+                # Detect receipts on the page
+                receipt_regions = detect_receipts(page_image)
+                print(f"Found {len(receipt_regions)} receipt regions on page {page_num + 1}")
+                
+                # Process each receipt region
+                for i, (x, y, w, h) in enumerate(receipt_regions):
+                    try:
+                        # Crop the image to get just this receipt
+                        receipt_image = page_image.crop((x, y, x+w, y+h))
                         
-                        # Read the temporary PDF and add it to the writer
-                        temp_pdf = PdfReader(img_path)
-                        pdf_writer.add_page(temp_pdf.pages[0])
+                        # Convert PIL Image to numpy array for OpenCV processing
+                        receipt_np = np.array(receipt_image)
+                        
+                        # Apply rotation correction to individual receipt
+                        corrected_np = correct_skew(
+                            receipt_np,
+                            debug_dir=debug_dir,
+                            debug_prefix=f"page_{page_num+1}_receipt_{i+1}",
+                            debug=True
+                        )
+                        
+                        # Convert back to PIL Image
+                        receipt_image = Image.fromarray(corrected_np)
+                        
+                        # Extract text from this specific receipt region
+                        text = pytesseract.image_to_string(receipt_image)
+                        print(f"\nProcessing receipt {i+1}:")
+                        print(f"Extracted text length: {len(text)}")
+                        
+                        # Save extracted text for debugging
+                        with open(os.path.join(debug_dir, f"page_{page_num + 1}_receipt_{i + 1}_text.txt"), 'w') as f:
+                            f.write(text)
+                        
+                        # Extract receipt information
+                        date = extract_date(text)
+                        vendor = extract_vendor(text)
+                        amount = extract_amount(text)
+                        
+                        print(f"Extracted info - Date: {date}, Vendor: {vendor}, Amount: {amount}")
+                        
+                        # Create filename
+                        base_filename = create_filename(date, vendor, amount)
+                        # Always add receipt number if multiple receipts found
+                        if len(receipt_regions) > 1:
+                            filename = f"{base_filename[:-4]}_{i+1}.pdf"
+                        else:
+                            filename = base_filename
+                        
+                        # Save the cropped image temporarily
+                        temp_image_path = os.path.join(output_folder, f"temp_receipt_{i}.png")
+                        receipt_image.save(temp_image_path)
+                        
+                        # Create a new PDF from the cropped image
+                        pdf_writer = PdfWriter()
+                        with Image.open(temp_image_path) as img:
+                            # Convert to RGB if needed
+                            if img.mode != 'RGB':
+                                img = img.convert('RGB')
+                            # Create PDF from image
+                            img_path = os.path.join(output_folder, f"temp_receipt_{i}.pdf")
+                            img.save(img_path, 'PDF', resolution=100.0)
+                            
+                            # Read the temporary PDF and add it to the writer
+                            temp_pdf = PdfReader(img_path)
+                            pdf_writer.add_page(temp_pdf.pages[0])
+                        
+                        # Save the final PDF
+                        output_filename = os.path.join(output_folder, filename)
+                        with open(output_filename, 'wb') as output_file:
+                            pdf_writer.write(output_file)
+                        
+                        # Clean up temporary files
+                        os.remove(temp_image_path)
+                        os.remove(img_path)
+                        
+                        print(f'Created: {output_filename}')
                     
-                    # Save the final PDF
-                    output_filename = os.path.join(output_folder, filename)
-                    with open(output_filename, 'wb') as output_file:
-                        pdf_writer.write(output_file)
-                    
-                    # Clean up temporary files
-                    os.remove(temp_image_path)
-                    os.remove(img_path)
-                    
-                    print(f'Created: {output_filename}')
-                
-                except Exception as e:
-                    print(f"Error processing receipt {i+1}: {str(e)}")
-                    continue
+                    except Exception as e:
+                        print(f"Error processing receipt {i+1}: {str(e)}")
+                        continue
                 
     except Exception as e:
         print(f"Error processing PDF: {str(e)}")
@@ -775,6 +854,57 @@ def form_receipt_rectangles(clusters):
             receipt_regions.append((x, y, w, h))
     
     return receipt_regions
+
+def detect_text_lines(binary_image):
+    """Detect text lines for more accurate rotation angle."""
+    # Use Hough transform to detect lines
+    lines = cv2.HoughLinesP(binary_image, 1, np.pi/180, 
+                           threshold=100, minLineLength=100, maxLineGap=10)
+    
+    if lines is None:
+        return None
+        
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 - x1 != 0:  # Avoid division by zero
+            angle = np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi
+            if -45 < angle < 45:  # Only consider roughly horizontal lines
+                angles.append(angle)
+                
+    return np.median(angles) if angles else None
+
+def evaluate_rotation_quality(original, rotated):
+    """Evaluate if rotation improved text alignment."""
+    # Convert to grayscale if needed
+    if len(original.shape) == 3:
+        original = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
+        rotated = cv2.cvtColor(rotated, cv2.COLOR_RGB2GRAY)
+    
+    # Calculate text line consistency
+    orig_score = measure_text_alignment(original)
+    rot_score = measure_text_alignment(rotated)
+    
+    return rot_score > orig_score
+
+def measure_text_alignment(image):
+    """Measure how well text lines are aligned horizontally."""
+    edges = cv2.Canny(image, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, 
+                           minLineLength=100, maxLineGap=10)
+    
+    if lines is None:
+        return 0
+        
+    # Calculate alignment score based on line angles
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 - x1 != 0:
+            angle = abs(np.arctan2(y2 - y1, x2 - x1) * 180.0 / np.pi)
+            angles.append(min(angle, 180 - angle))
+            
+    return 1.0 / (np.std(angles) + 1e-6) if angles else 0
 
 if __name__ == "__main__":
     # Use absolute paths
