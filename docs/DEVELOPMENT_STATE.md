@@ -1,8 +1,25 @@
 # Development State
 
-## Current Phase: Multi-Receipt Detection
-Branch: feat/improve-receipt-detection
-Status: ✅ Working for multiple receipts on single page
+## Current Phase: Receipt Region Detection Fix
+Branch: fix/receipt-region-detection
+Status: 🔄 Troubleshooting multi-page detection
+
+### Current Issues:
+- Incorrect receipt region detection
+- Test case: 4 pages, 1 receipt per page
+- Debug visualization needed for each detection step
+
+### Debugging Steps:
+1. Visual inspection of detection stages
+2. Parameter tuning for detection
+3. Text pattern analysis validation
+4. Region merging verification
+
+### Test Document:
+- 4 separate pages
+- 1 receipt per page
+- Various orientations
+- Different receipt types
 
 ## Working Features
 - Multiple receipt detection on single page

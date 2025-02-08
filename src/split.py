@@ -86,10 +86,8 @@ def should_merge_regions(region1, region2, gray_image, proximity_threshold_px):
     horizontal_overlap = (min(x1 + w1, x2 + w2) - max(x1, x2)) > 0
     
     # Calculate distances
-    vertical_distance = (min(abs(y1 - (y2 + h2)), abs((y1 + h1) - y2)) 
-                        if not vertical_overlap else 0)
-    horizontal_distance = (min(abs(x1 - (x2 + w2)), abs((x1 + w1) - x2)) 
-                         if not horizontal_overlap else 0)
+    vertical_distance = min(abs(y1 - (y2 + h2)), abs((y1 + h1) - y2)) if not vertical_overlap else 0
+    horizontal_distance = min(abs(x1 - (x2 + w2)), abs((x1 + w1) - x2)) if not horizontal_overlap else 0
     
     # Analyze text patterns in both regions
     pattern1 = analyze_text_pattern(gray_image, x1, y1, w1, h1)
@@ -316,13 +314,307 @@ def correct_skew(image, debug_dir=None, debug_prefix="", debug=False):
             print("Rotation did not improve alignment - keeping original")
         return image
 
+def enhance_image(image):
+    """Enhanced image preprocessing with target thresholds for readability"""
+    if isinstance(image, Image.Image):
+        image_np = np.array(image)
+    else:
+        image_np = image
+        
+    # Convert to grayscale if needed
+    if len(image_np.shape) == 3:
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image_np
+    
+    # Target values
+    TARGET_DARKNESS = 60  # Aim for at least 60 darkness
+    TARGET_CONTRAST = 70  # Aim for higher contrast
+    
+    # Calculate how much we need to adjust
+    current_darkness = 255 - np.mean(gray)
+    darkness_adjustment = (TARGET_DARKNESS - current_darkness) / 255.0
+    
+    # Create enhanced versions
+    enhanced_versions = []
+    
+    # 1. Strong contrast enhancement to reach target values
+    alpha = 3.0 + darkness_adjustment * 3  # Increase alpha based on needed darkness
+    beta = -50 * darkness_adjustment       # Adjust beta to darken more if needed
+    enhanced = cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
+    enhanced_versions.append(enhanced)
+    
+    # 2. Very aggressive CLAHE
+    clahe = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(2,2))
+    enhanced_clahe = clahe.apply(gray)
+    # Add darkness bias to reach target
+    enhanced_clahe = cv2.addWeighted(enhanced_clahe, 1, np.zeros_like(enhanced_clahe), 0, -40)
+    enhanced_versions.append(enhanced_clahe)
+    
+    # 3. Strong morphological operations
+    kernel = np.ones((5,5), np.uint8)
+    darkened = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    darkened = cv2.addWeighted(darkened, 1, np.zeros_like(darkened), 0, -50)
+    enhanced_versions.append(darkened)
+    
+    # 4. Combine all enhancements with strong darkness bias
+    combined = np.zeros_like(gray)
+    for enhanced in enhanced_versions:
+        normalized = cv2.normalize(enhanced, None, 0, 255, cv2.NORM_MINMAX)
+        darkened = cv2.addWeighted(normalized, 1, np.zeros_like(normalized), 0, -45)
+        combined = cv2.addWeighted(combined, 0.3, darkened, 0.7, 0)
+    
+    enhanced_versions.append(combined)
+    
+    # Create binary versions with aggressive thresholds
+    binary_versions = []
+    for enhanced in enhanced_versions:
+        # Standard binary with low threshold to catch light text
+        _, binary = cv2.threshold(enhanced, 75, 255, cv2.THRESH_BINARY)
+        binary_versions.append(binary)
+        
+        # Adaptive threshold with reduced C value
+        binary_adaptive = cv2.adaptiveThreshold(
+            enhanced,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            21,
+            2  # Very low C value to catch light text
+        )
+        binary_versions.append(binary_adaptive)
+    
+    # Save debug images
+    debug_dir = create_debug_directory(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for i, img in enumerate(enhanced_versions):
+        cv2.imwrite(os.path.join(debug_dir, f"enhanced_{i}.png"), img)
+        # Analyze and print metrics for each enhancement
+        metrics = analyze_text_darkness(img)
+        print(f"\nEnhanced version {i} metrics:")
+        print(f"• Darkness: {metrics['average_darkness']:.2f}")
+        print(f"• Contrast: {metrics['contrast']:.2f}")
+        print(f"• Text ratio: {metrics['text_ratio']*100:.2f}%")
+    
+    return enhanced_versions, binary_versions
+
+def analyze_text_darkness(image):
+    """Analyze text darkness and contrast in the image"""
+    # Convert to numpy array if it's a PIL Image
+    if isinstance(image, Image.Image):
+        image_np = np.array(image)
+    else:
+        image_np = image.copy()  # Make a copy if it's already numpy array
+    
+    # Convert to grayscale if needed
+    if len(image_np.shape) == 3:
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image_np
+    
+    # Calculate average darkness (0 is black, 255 is white)
+    avg_darkness = 255 - np.mean(gray)
+    
+    # Calculate contrast
+    contrast = np.std(gray)
+    
+    # Calculate text-to-background ratio using Otsu's thresholding
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    text_pixels = np.sum(binary == 0)  # Count black pixels (text)
+    total_pixels = binary.size
+    text_ratio = text_pixels / total_pixels
+    
+    return {
+        'average_darkness': avg_darkness,
+        'contrast': contrast,
+        'text_ratio': text_ratio
+    }
+
+def analyze_text_quality(text, patterns):
+    """Analyze why text patterns aren't being detected"""
+    analysis = {}
+    
+    for component, pattern_list in patterns.items():
+        matches = []
+        closest_matches = []
+        
+        # Check each pattern
+        for pattern in pattern_list:
+            # Look for exact matches
+            found = re.findall(pattern, text, re.IGNORECASE)
+            if found:
+                matches.extend(found)
+            
+            # Look for close matches (text that almost matches the pattern)
+            lines = text.split('\n')
+            for line in lines:
+                if any(keyword in line.lower() for keyword in pattern.lower().split('|')):
+                    closest_matches.append(line.strip())
+        
+        analysis[component] = {
+            'detected': bool(matches),
+            'matches': matches,
+            'closest_matches': closest_matches,
+            'pattern_tried': pattern_list
+        }
+    
+    return analysis
+
+def is_receipt_like(image, text):
+    """Enhanced receipt detection with detailed analysis"""
+    print("\n🔍 Raw Extracted Text:")
+    print(text)
+    
+    confidence_score = 0
+    total_checks = 0
+    
+    # Analyze text darkness before enhancement
+    print("\n📊 Text Quality Analysis (Before Enhancement):")
+    original_darkness = analyze_text_darkness(image)
+    print(f"• Average darkness: {original_darkness['average_darkness']:.2f} (0-255, higher is darker)")
+    print(f"• Contrast: {original_darkness['contrast']:.2f}")
+    print(f"• Text-to-background ratio: {original_darkness['text_ratio']*100:.2f}%")
+    
+    # Enhance image and analyze after enhancement
+    enhanced_versions, binary_versions = enhance_image(image)
+    print("\n📊 Text Quality Analysis (After Enhancement):")
+    enhanced_darkness = analyze_text_darkness(enhanced_versions[-1])  # Check last (combined) enhancement
+    print(f"• Average darkness: {enhanced_darkness['average_darkness']:.2f} (0-255, higher is darker)")
+    print(f"• Contrast: {enhanced_darkness['contrast']:.2f}")
+    print(f"• Text-to-background ratio: {enhanced_darkness['text_ratio']*100:.2f}%")
+    
+    # Define receipt patterns with more flexible matching
+    patterns = {
+        'date': [
+            r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}',  # Standard date
+            r'\d{2}:\d{2}:\d{2}',                   # Time format
+            r'(?:AM|PM)',                           # Time of day
+            r'DATE.*',                              # Date label
+            r'\d{2}/\d{2}/\d{4}'                   # Full date format
+        ],
+        'total': [
+            r'total.*\$?\d+\.\d{2}',               # Total amount
+            r'amount.*\$?\d+\.\d{2}',              # Amount
+            r'paid.*\$?\d+\.\d{2}',                # Amount paid
+            r'fee.*\$?\d+\.\d{2}',                 # Fee amount
+            r'\$\d+\.\d{2}',                       # Just dollar amount
+            r'\d+\.\d{2}'                          # Just decimal number
+        ],
+        'identifier': [
+            r'receipt\s*#?\s*\d+',                 # Receipt number (more flexible)
+            r'file\s*#?\s*\d+',                    # File number
+            r'clerk.*record',                      # Government office
+            r'deputy',                             # Official title
+            r'\d{6,}'                              # Long number (likely a receipt number)
+        ],
+        'vendor': [
+            r'county',                             # Government office
+            r'clerk',                              # Official title
+            r'recorder',                           # Official title
+            r'^[A-Z][a-zA-Z\s\-]+$',              # Proper name
+            r'ALAMEDA',                            # Specific to this receipt
+            r'[A-Z\s]{10,}'                        # Any long uppercase text
+        ]
+    }
+    
+    # Analyze text pattern matching
+    print("\n🔍 Text Pattern Analysis:")
+    text_analysis = analyze_text_quality(text, patterns)
+    
+    # Check each pattern group and provide detailed feedback
+    for component, analysis in text_analysis.items():
+        total_checks += 1
+        if analysis['detected']:
+            confidence_score += 1
+            print(f"✓ Found {component}: {analysis['matches']}")
+        else:
+            print(f"✗ Missing {component}")
+            if analysis['closest_matches']:
+                print(f"  • Found similar text: {analysis['closest_matches']}")
+            print(f"  • Tried patterns: {analysis['pattern_tried']}")
+    
+    # Visual characteristics checks
+    print("\n👁️ Visual Characteristics Analysis:")
+    total_checks += 3
+    
+    # Check for dotted lines
+    has_dots = any(has_dotted_lines(binary) for binary in binary_versions)
+    if has_dots:
+        confidence_score += 1
+        print("✓ Found dotted lines pattern")
+    else:
+        print("✗ Missing dotted lines pattern")
+    
+    # Check for consistent line spacing
+    has_spacing = any(has_consistent_line_spacing(binary) for binary in binary_versions)
+    if has_spacing:
+        confidence_score += 1
+        print("✓ Found consistent line spacing")
+    else:
+        print("✗ Inconsistent line spacing")
+    
+    # Check for form-like structure
+    has_structure = has_form_structure(binary_versions[0])
+    if has_structure:
+        confidence_score += 1
+        print("✓ Found form-like structure")
+    else:
+        print("✗ Missing form-like structure")
+    
+    # Calculate final confidence
+    confidence = confidence_score / total_checks
+    is_receipt = confidence >= 0.20  # Lower threshold from 0.25 to 0.20
+    
+    print(f"\n📈 Overall Analysis:")
+    print(f"• Confidence Score: {confidence:.2f} ({confidence_score}/{total_checks} checks passed)")
+    print(f"• Receipt Detection: {'✓ Passed' if is_receipt else '✗ Failed'}")
+    
+    return is_receipt, confidence
+
+def has_dotted_lines(binary_image):
+    """Detect presence of dotted lines common in official receipts"""
+    # Use horizontal projection
+    h_projection = np.sum(binary_image == 0, axis=1)
+    
+    # Look for alternating patterns
+    diff = np.diff(h_projection)
+    alternating = np.sum(np.abs(diff[:-1] * diff[1:])) < 0
+    
+    return alternating
+
+def has_form_structure(binary_image):
+    """Detect if image has a form-like structure"""
+    # Look for aligned text blocks
+    v_projection = np.sum(binary_image == 0, axis=0)
+    
+    # Smooth the projection
+    smoothed = np.convolve(v_projection, np.ones(20)/20, mode='same')
+    
+    # Find peaks that might indicate aligned text starts
+    peaks = []
+    threshold = np.mean(smoothed) * 1.2
+    for i in range(1, len(smoothed)-1):
+        if smoothed[i] > threshold and smoothed[i] > smoothed[i-1] and smoothed[i] > smoothed[i+1]:
+            peaks.append(i)
+    
+    # Check if we have enough aligned peaks
+    return len(peaks) >= 3
+
 def detect_receipts(image):
-    """Detect and return coordinates of multiple receipts in an image"""
+    """Detect and return coordinates of receipts in an image"""
     # Convert PIL Image to numpy array
     image_np = np.array(image)
     
-    # Create debug directory with timestamp
+    # Create debug directory
     debug_dir = create_debug_directory(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    
+    # First, check if the whole page is one receipt
+    text = pytesseract.image_to_string(image_np)
+    is_full_receipt, confidence = is_receipt_like(image_np, text)
+    
+    if is_full_receipt:
+        print(f"📄 Detected full page receipt (confidence: {confidence:.2f})")
+        height, width = image_np.shape[:2]
+        return [(0, 0, width, height)]  # Return whole page coordinates
     
     # Convert to grayscale
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
@@ -647,7 +939,7 @@ def split_pages(input_path, output_folder):
                         receipt_image = Image.fromarray(corrected_np)
                         
                         # Extract text from this specific receipt region
-                        text = pytesseract.image_to_string(receipt_image)
+                        text = extract_text_with_config(receipt_image)
                         print(f"\nProcessing receipt {i+1}:")
                         print(f"Extracted text length: {len(text)}")
                         
@@ -906,6 +1198,97 @@ def measure_text_alignment(image):
             
     return 1.0 / (np.std(angles) + 1e-6) if angles else 0
 
+def extract_text_with_config(image):
+    """Extract text with optimized OCR configuration for light text"""
+    custom_configs = [
+        r'--oem 3 --psm 6 -c tessedit_char_whitelist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.$-:/ " --dpi 300',
+        r'--oem 3 --psm 6 --dpi 300',  # Try without whitelist
+        r'--oem 3 --psm 3 --dpi 300'   # Try different page segmentation mode
+    ]
+    
+    # Get enhanced versions
+    enhanced_versions, binary_versions = enhance_image(image)
+    
+    # Try OCR on all versions with all configs
+    texts = []
+    
+    # Original image
+    for config in custom_configs:
+        texts.append(pytesseract.image_to_string(image, config=config))
+    
+    # Enhanced versions
+    for enhanced in enhanced_versions:
+        for config in custom_configs:
+            texts.append(pytesseract.image_to_string(
+                Image.fromarray(enhanced), 
+                config=config
+            ))
+    
+    # Binary versions
+    for binary in binary_versions:
+        for config in custom_configs:
+            texts.append(pytesseract.image_to_string(
+                Image.fromarray(binary), 
+                config=config
+            ))
+    
+    # Remove empty strings and duplicates
+    texts = [t for t in texts if t.strip()]
+    texts = list(set(texts))
+    
+    # Return the text with the most content and meaningful characters
+    def score_text(text):
+        # Count meaningful patterns (numbers, dollar amounts, dates)
+        patterns = [
+            r'\d+\.\d{2}',          # Dollar amounts
+            r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}',  # Dates
+            r'[A-Z]{2,}',           # Uppercase words (likely headers)
+        ]
+        score = 0
+        for pattern in patterns:
+            score += len(re.findall(pattern, text))
+        return score + len(text)
+    
+    return max(texts, key=score_text)
+
+def detect_columns(binary_image):
+    """Detect number of columns in the image"""
+    # Project text onto horizontal axis
+    h_projection = np.sum(binary_image == 0, axis=0)
+    
+    # Smooth projection
+    smoothed = np.convolve(h_projection, np.ones(20)/20, mode='same')
+    
+    # Find peaks (potential columns)
+    peaks = []
+    threshold = np.mean(smoothed) * 1.5
+    for i in range(1, len(smoothed)-1):
+        if smoothed[i] > threshold and smoothed[i] > smoothed[i-1] and smoothed[i] > smoothed[i+1]:
+            peaks.append(i)
+    
+    return len(peaks)
+
+def has_consistent_line_spacing(binary_image):
+    """Check if the image has consistent line spacing (typical of receipts)"""
+    # Project text onto vertical axis
+    v_projection = np.sum(binary_image == 0, axis=1)
+    
+    # Find peaks (text lines)
+    peaks = []
+    threshold = np.mean(v_projection) * 1.2
+    for i in range(1, len(v_projection)-1):
+        if v_projection[i] > threshold and v_projection[i] > v_projection[i-1] and v_projection[i] > v_projection[i+1]:
+            peaks.append(i)
+    
+    if len(peaks) < 3:  # Need at least 3 lines to check consistency
+        return False
+    
+    # Calculate line spacings
+    spacings = np.diff(peaks)
+    
+    # Check if spacings are consistent (low variance)
+    return np.std(spacings) / np.mean(spacings) < 0.5
+
 if __name__ == "__main__":
     # Use absolute paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -916,4 +1299,29 @@ if __name__ == "__main__":
     print(f"Output directory: {output_dir}")
     print(f"Input file exists: {os.path.exists(input_pdf)}")
     
-    split_pages(input_pdf, output_dir)
+    # TEMPORARY: Just split page 1 without detection
+    try:
+        # Convert page 1 to image
+        images = convert_from_path(
+            pdf_path=input_pdf,
+            first_page=1,
+            last_page=1,
+            poppler_path=r'C:\Program Files\poppler-24.08.0\Library\bin'
+        )
+        
+        if images:
+            page_image = images[0]
+            
+            # Save as PDF directly
+            output_filename = os.path.join(output_dir, "page_1_split.pdf")
+            
+            # Convert to RGB if needed
+            if page_image.mode != 'RGB':
+                page_image = page_image.convert('RGB')
+            
+            # Save as PDF
+            page_image.save(output_filename, 'PDF', resolution=100.0)
+            print(f"\nCreated: {output_filename}")
+            
+    except Exception as e:
+        print(f"Error splitting page: {str(e)}")
