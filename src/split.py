@@ -1299,29 +1299,11 @@ if __name__ == "__main__":
     print(f"Output directory: {output_dir}")
     print(f"Input file exists: {os.path.exists(input_pdf)}")
     
-    # TEMPORARY: Just split page 1 without detection
     try:
-        # Convert page 1 to image
-        images = convert_from_path(
-            pdf_path=input_pdf,
-            first_page=1,
-            last_page=1,
-            poppler_path=r'C:\Program Files\poppler-24.08.0\Library\bin'
-        )
+        # Process the PDF
+        split_pages(input_pdf, output_dir)
+        print("\nPDF processing completed successfully!")
         
-        if images:
-            page_image = images[0]
-            
-            # Save as PDF directly
-            output_filename = os.path.join(output_dir, "page_1_split.pdf")
-            
-            # Convert to RGB if needed
-            if page_image.mode != 'RGB':
-                page_image = page_image.convert('RGB')
-            
-            # Save as PDF
-            page_image.save(output_filename, 'PDF', resolution=100.0)
-            print(f"\nCreated: {output_filename}")
-            
     except Exception as e:
-        print(f"Error splitting page: {str(e)}")
+        print(f"\nError processing PDF: {str(e)}")
+
